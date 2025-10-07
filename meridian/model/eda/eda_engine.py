@@ -16,11 +16,12 @@
 
 import dataclasses
 import functools
-from typing import Callable, Dict, Optional, Sequence, TypeAlias
+from typing import Optional, Sequence
 from meridian import constants
 from meridian.model import model
 from meridian.model import transformers
 from meridian.model.eda import eda_outcome
+from meridian.model.eda import eda_spec
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -28,17 +29,30 @@ import xarray as xr
 
 
 _DEFAULT_DA_VAR_AGG_FUNCTION = np.sum
-AggregationMap: TypeAlias = Dict[str, Callable[[xr.DataArray], np.ndarray]]
 _CORRELATION_COL_NAME = 'correlation'
+_STACK_VAR_COORD_NAME = 'var'
 _CORR_VAR1 = 'var1'
 _CORR_VAR2 = 'var2'
 _CORRELATION_MATRIX_NAME = 'correlation_matrix'
-_PAIRWISE_OVERALL_CORR_THRESHOLD = 0.999
-_PAIRWISE_GEO_CORR_THRESHOLD = 0.999
-_PAIRWISE_NATIONAL_CORR_THRESHOLD = 0.999
+_OVERALL_PAIRWISE_CORR_THRESHOLD = 0.999
+_GEO_PAIRWISE_CORR_THRESHOLD = 0.999
+_NATIONAL_PAIRWISE_CORR_THRESHOLD = 0.999
 _EMPTY_DF_FOR_EXTREME_CORR_PAIRS = pd.DataFrame(
     columns=[_CORR_VAR1, _CORR_VAR2, _CORRELATION_COL_NAME]
 )
+_Q1_THRESHOLD = 0.25
+_Q3_THRESHOLD = 0.75
+_IQR_MULTIPLIER = 1.5
+_STD_WITH_OUTLIERS_VAR_NAME = 'std_with_outliers'
+_STD_WITHOUT_OUTLIERS_VAR_NAME = 'std_without_outliers'
+_OUTLIERS_COL_NAME = 'outliers'
+_ABS_OUTLIERS_COL_NAME = 'abs_outliers'
+
+
+class GeoLevelCheckOnNationalModelError(Exception):
+  """Raised when a geo-level check is called on a national model."""
+
+  pass
 
 
 @dataclasses.dataclass(frozen=True)
@@ -116,23 +130,6 @@ class ReachFrequencyData:
   national_rf_impressions_raw_da: xr.DataArray
 
 
-@dataclasses.dataclass(frozen=True, kw_only=True)
-class AggregationConfig:
-  """Configuration for custom aggregation functions.
-
-  Attributes:
-    control_variables: A dictionary mapping control variable names to
-      aggregation functions. Defaults to `np.sum` if a variable is not
-      specified.
-    non_media_treatments: A dictionary mapping non-media variable names to
-      aggregation functions. Defaults to `np.sum` if a variable is not
-      specified.
-  """
-
-  control_variables: AggregationMap = dataclasses.field(default_factory=dict)
-  non_media_treatments: AggregationMap = dataclasses.field(default_factory=dict)
-
-
 def _data_array_like(
     *, da: xr.DataArray, values: np.ndarray | tf.Tensor
 ) -> xr.DataArray:
@@ -156,7 +153,9 @@ def _data_array_like(
   )
 
 
-def _stack_variables(ds: xr.Dataset, coord_name: str) -> xr.DataArray:
+def _stack_variables(
+    ds: xr.Dataset, coord_name: str = _STACK_VAR_COORD_NAME
+) -> xr.DataArray:
   """Stacks data variables other than time and geo into a single variable."""
   dims = []
   coords = []
@@ -170,17 +169,17 @@ def _stack_variables(ds: xr.Dataset, coord_name: str) -> xr.DataArray:
     coords.extend(ds.coords[dim].values.tolist())
 
   da = ds.to_stacked_array(coord_name, sample_dims=sample_dims)
-  da = da.reset_index(dims).assign_coords({coord_name: coords})
+  da = da.reset_index(dims, drop=True).assign_coords({coord_name: coords})
   return da
 
 
 def _compute_correlation_matrix(
-    dataset: xr.Dataset, dims: str | Sequence[str]
+    input_da: xr.DataArray, dims: str | Sequence[str]
 ) -> xr.DataArray:
-  """Computes the correlation matrix for a dataset.
+  """Computes the correlation matrix for variables in a DataArray.
 
   Args:
-    dataset: An xr.Dataset containing variables for which to compute
+    input_da: An xr.DataArray containing variables for which to compute
       correlations.
     dims: Dimensions along which to compute correlations. Can only be TIME or
       GEO.
@@ -189,8 +188,8 @@ def _compute_correlation_matrix(
     An xr.DataArray containing the correlation matrix.
   """
   # Create two versions for correlation
-  da1 = _stack_variables(dataset, _CORR_VAR1)
-  da2 = _stack_variables(dataset, _CORR_VAR2)
+  da1 = input_da.rename({_STACK_VAR_COORD_NAME: _CORR_VAR1})
+  da2 = input_da.rename({_STACK_VAR_COORD_NAME: _CORR_VAR2})
 
   # Compute pairwise correlation across dims. Other dims are broadcasted.
   corr_mat_da = xr.corr(da1, da2, dim=dims)
@@ -236,16 +235,66 @@ def _find_extreme_corr_pairs(
   )
 
 
+def _calculate_std(
+    input_da: xr.DataArray,
+) -> tuple[xr.Dataset, pd.DataFrame]:
+  """Helper function to compute std with and without outliers.
+
+  Args:
+    input_da: A DataArray for which to calculate the std.
+
+  Returns:
+    A tuple where the first element is a Dataset with two data variables:
+    'std_incl_outliers' and 'std_excl_outliers'. The second element is a
+    DataFrame with columns for variables, geo (if applicable), time, and
+    outlier values.
+  """
+  std_with_outliers = input_da.std(dim=constants.TIME, ddof=1)
+
+  # TODO: Allow users to specify custom outlier definitions.
+  q1 = input_da.quantile(_Q1_THRESHOLD, dim=constants.TIME)
+  q3 = input_da.quantile(_Q3_THRESHOLD, dim=constants.TIME)
+  iqr = q3 - q1
+  lower_bound = q1 - _IQR_MULTIPLIER * iqr
+  upper_bound = q3 + _IQR_MULTIPLIER * iqr
+
+  da_no_outlier = input_da.where(
+      (input_da >= lower_bound) & (input_da <= upper_bound)
+  )
+  std_without_outliers = da_no_outlier.std(dim=constants.TIME, ddof=1)
+
+  std_ds = xr.Dataset({
+      _STD_WITH_OUTLIERS_VAR_NAME: std_with_outliers,
+      _STD_WITHOUT_OUTLIERS_VAR_NAME: std_without_outliers,
+  })
+
+  outlier_da = input_da.where(
+      (input_da < lower_bound) | (input_da > upper_bound)
+  )
+
+  outlier_df = outlier_da.to_dataframe(name=_OUTLIERS_COL_NAME).dropna()
+  outlier_df = outlier_df.assign(
+      **{_ABS_OUTLIERS_COL_NAME: np.abs(outlier_df[_OUTLIERS_COL_NAME])}
+  ).sort_values(by=_ABS_OUTLIERS_COL_NAME, ascending=False, inplace=False)
+
+  return std_ds, outlier_df
+
+
 class EDAEngine:
   """Meridian EDA Engine."""
 
   def __init__(
       self,
       meridian: model.Meridian,
-      agg_config: AggregationConfig = AggregationConfig(),
+      spec: eda_spec.EDASpec = eda_spec.EDASpec(),
   ):
     self._meridian = meridian
-    self._agg_config = agg_config
+    self._spec = spec
+    self._agg_config = self._spec.aggregation_config
+
+  @property
+  def spec(self) -> eda_spec.EDASpec:
+    return self._spec
 
   @functools.cached_property
   def controls_scaled_da(self) -> xr.DataArray | None:
@@ -691,6 +740,13 @@ class EDAEngine:
     return xr.merge(to_merge, join='inner')
 
   @functools.cached_property
+  def _stacked_treatment_control_scaled_da(self) -> xr.DataArray:
+    """Returns a stacked DataArray of treatment_control_scaled_ds."""
+    da = _stack_variables(self.treatment_control_scaled_ds)
+    da.name = constants.TREATMENT_CONTROL_SCALED
+    return da
+
+  @functools.cached_property
   def national_treatment_control_scaled_ds(self) -> xr.Dataset:
     """Returns a Dataset containing all scaled treatments and controls.
 
@@ -710,6 +766,13 @@ class EDAEngine:
         if da is not None
     ]
     return xr.merge(to_merge_national, join='inner')
+
+  @functools.cached_property
+  def _stacked_national_treatment_control_scaled_da(self) -> xr.DataArray:
+    """Returns a stacked DataArray of national_treatment_control_scaled_ds."""
+    da = _stack_variables(self.national_treatment_control_scaled_ds)
+    da.name = constants.NATIONAL_TREATMENT_CONTROL_SCALED
+    return da
 
   @functools.cached_property
   def all_reach_scaled_da(self) -> xr.DataArray | None:
@@ -774,18 +837,19 @@ class EDAEngine:
       A DataArray containing all national-level scaled reach data, or None if
       no RF or organic RF channels are present.
     """
-    reach_national_das = []
+    national_reach_das = []
     if self.national_reach_scaled_da is not None:
-      reach_national_das.append(self.national_reach_scaled_da)
-    if self.national_organic_reach_scaled_da is not None:
-      reach_national_das.append(
-          self.national_organic_reach_scaled_da.rename(
+      national_reach_das.append(self.national_reach_scaled_da)
+    national_organic_reach_scaled_da = self.national_organic_reach_scaled_da
+    if national_organic_reach_scaled_da is not None:
+      national_reach_das.append(
+          national_organic_reach_scaled_da.rename(
               {constants.ORGANIC_RF_CHANNEL: constants.RF_CHANNEL}
           )
       )
-    if not reach_national_das:
+    if not national_reach_das:
       return None
-    da = xr.concat(reach_national_das, dim=constants.RF_CHANNEL)
+    da = xr.concat(national_reach_das, dim=constants.RF_CHANNEL)
     da.name = constants.NATIONAL_ALL_REACH_SCALED
     return da
 
@@ -800,18 +864,19 @@ class EDAEngine:
       A DataArray containing all national-level frequency data, or None if no
       RF or organic RF channels are present.
     """
-    freq_national_das = []
+    national_freq_das = []
     if self.national_frequency_da is not None:
-      freq_national_das.append(self.national_frequency_da)
-    if self.national_organic_frequency_da is not None:
-      freq_national_das.append(
-          self.national_organic_frequency_da.rename(
+      national_freq_das.append(self.national_frequency_da)
+    national_organic_frequency_da = self.national_organic_frequency_da
+    if national_organic_frequency_da is not None:
+      national_freq_das.append(
+          national_organic_frequency_da.rename(
               {constants.ORGANIC_RF_CHANNEL: constants.RF_CHANNEL}
           )
       )
-    if not freq_national_das:
+    if not national_freq_das:
       return None
-    da = xr.concat(freq_national_das, dim=constants.RF_CHANNEL)
+    da = xr.concat(national_freq_das, dim=constants.RF_CHANNEL)
     da.name = constants.NATIONAL_ALL_FREQUENCY
     return da
 
@@ -859,15 +924,15 @@ class EDAEngine:
 
   def _aggregate_variables(
       self,
-      da_geo: xr.DataArray,
+      geo_da: xr.DataArray,
       channel_dim: str,
-      da_var_agg_map: AggregationMap,
+      da_var_agg_map: eda_spec.AggregationMap,
       keepdims: bool = True,
   ) -> xr.DataArray:
     """Aggregates variables within a DataArray based on user-defined functions.
 
     Args:
-      da_geo: The geo-level DataArray containing multiple variables along
+      geo_da: The geo-level DataArray containing multiple variables along
         channel_dim.
       channel_dim: The name of the dimension coordinate to aggregate over (e.g.,
         constants.CONTROL_VARIABLE).
@@ -880,8 +945,8 @@ class EDAEngine:
       aggregated according to the da_var_agg_map.
     """
     agg_results = []
-    for var_name in da_geo[channel_dim].values:
-      var_data = da_geo.sel({channel_dim: var_name})
+    for var_name in geo_da[channel_dim].values:
+      var_data = geo_da.sel({channel_dim: var_name})
       agg_func = da_var_agg_map.get(var_name, _DEFAULT_DA_VAR_AGG_FUNCTION)
       # Apply the aggregation function over the GEO dimension
       aggregated_data = var_data.reduce(
@@ -894,16 +959,16 @@ class EDAEngine:
 
   def _aggregate_and_scale_geo_da(
       self,
-      da_geo: xr.DataArray,
+      geo_da: xr.DataArray,
       national_da_name: str,
       transformer_class: Optional[type[transformers.TensorTransformer]],
       channel_dim: Optional[str] = None,
-      da_var_agg_map: Optional[AggregationMap] = None,
+      da_var_agg_map: Optional[eda_spec.AggregationMap] = None,
   ) -> xr.DataArray:
     """Aggregate geo-level xr.DataArray to national level and then scale values.
 
     Args:
-      da_geo: The geo-level DataArray to convert.
+      geo_da: The geo-level DataArray to convert.
       national_da_name: The name for the returned national DataArray.
       transformer_class: The TensorTransformer class to apply after summing to
         national level. Must be None, CenteringAndScalingTransformer, or
@@ -923,21 +988,21 @@ class EDAEngine:
       da_var_agg_map = {}
 
     if channel_dim is not None:
-      da_national = self._aggregate_variables(
-          da_geo, channel_dim, da_var_agg_map
+      national_da = self._aggregate_variables(
+          geo_da, channel_dim, da_var_agg_map
       )
     else:
-      da_national = da_geo.sum(
+      national_da = geo_da.sum(
           dim=constants.GEO, keepdims=True, skipna=False, keep_attrs=True
       )
 
-    da_national = da_national.assign_coords({constants.GEO: [temp_geo_dim]})
-    da_national.values = tf.cast(da_national.values, tf.float32)
-    da_national = self._scale_xarray(da_national, transformer_class)
+    national_da = national_da.assign_coords({constants.GEO: [temp_geo_dim]})
+    national_da.values = tf.cast(national_da.values, tf.float32)
+    national_da = self._scale_xarray(national_da, transformer_class)
 
-    da_national = da_national.sel({constants.GEO: temp_geo_dim}, drop=True)
-    da_national.name = national_da_name
-    return da_national
+    national_da = national_da.sel({constants.GEO: temp_geo_dim}, drop=True)
+    national_da.name = national_da_name
+    return national_da
 
   def _get_rf_data(
       self,
@@ -1057,25 +1122,34 @@ class EDAEngine:
   ) -> tuple[xr.DataArray, pd.DataFrame]:
     """Get pairwise correlation among treatments and controls for geo data."""
     corr_mat = _compute_correlation_matrix(
-        self.treatment_control_scaled_ds, dims=dims
+        self._stacked_treatment_control_scaled_da, dims=dims
     )
     extreme_corr_var_pairs_df = _find_extreme_corr_pairs(
         corr_mat, extreme_corr_threshold
     )
     return corr_mat, extreme_corr_var_pairs_df
 
-  def check_pairwise_corr_geo(self) -> eda_outcome.PairwiseCorrOutcome:
+  def check_geo_pairwise_corr(self) -> eda_outcome.PairwiseCorrOutcome:
     """Checks pairwise correlation among treatments and controls for geo data.
 
     Returns:
       An EDAOutcome object with findings and result values.
+
+    Raises:
+      GeoLevelCheckOnNationalModelError: If the model is national.
     """
+    # If the model is national, raise an error.
+    if self._meridian.is_national:
+      raise GeoLevelCheckOnNationalModelError(
+          'check_geo_pairwise_corr is not supported for national models.'
+      )
+
     findings = []
 
     overall_corr_mat, overall_extreme_corr_var_pairs_df = (
         self._pairwise_corr_for_geo_data(
             dims=[constants.GEO, constants.TIME],
-            extreme_corr_threshold=_PAIRWISE_OVERALL_CORR_THRESHOLD,
+            extreme_corr_threshold=_OVERALL_PAIRWISE_CORR_THRESHOLD,
         )
     )
     if not overall_extreme_corr_var_pairs_df.empty:
@@ -1095,7 +1169,7 @@ class EDAEngine:
     geo_corr_mat, geo_extreme_corr_var_pairs_df = (
         self._pairwise_corr_for_geo_data(
             dims=constants.TIME,
-            extreme_corr_threshold=_PAIRWISE_GEO_CORR_THRESHOLD,
+            extreme_corr_threshold=_GEO_PAIRWISE_CORR_THRESHOLD,
         )
     )
     # Overall correlation and per-geo correlation findings are mutually
@@ -1134,16 +1208,16 @@ class EDAEngine:
 
     pairwise_corr_results = [
         eda_outcome.PairwiseCorrResult(
-            level=eda_outcome.CorrelationAnalysisLevel.OVERALL,
+            level=eda_outcome.AnalysisLevel.OVERALL,
             corr_matrix=overall_corr_mat,
             extreme_corr_var_pairs=overall_extreme_corr_var_pairs_df,
-            extreme_corr_threshold=_PAIRWISE_OVERALL_CORR_THRESHOLD,
+            extreme_corr_threshold=_OVERALL_PAIRWISE_CORR_THRESHOLD,
         ),
         eda_outcome.PairwiseCorrResult(
-            level=eda_outcome.CorrelationAnalysisLevel.GEO,
+            level=eda_outcome.AnalysisLevel.GEO,
             corr_matrix=geo_corr_mat,
             extreme_corr_var_pairs=geo_extreme_corr_var_pairs_df,
-            extreme_corr_threshold=_PAIRWISE_GEO_CORR_THRESHOLD,
+            extreme_corr_threshold=_GEO_PAIRWISE_CORR_THRESHOLD,
         ),
     ]
 
@@ -1152,7 +1226,7 @@ class EDAEngine:
         pairwise_corr_results=pairwise_corr_results,
     )
 
-  def check_pairwise_corr_national(self) -> eda_outcome.PairwiseCorrOutcome:
+  def check_national_pairwise_corr(self) -> eda_outcome.PairwiseCorrOutcome:
     """Checks pairwise correlation among treatments and controls for national data.
 
     Returns:
@@ -1161,10 +1235,10 @@ class EDAEngine:
     findings = []
 
     corr_mat = _compute_correlation_matrix(
-        self.national_treatment_control_scaled_ds, dims=constants.TIME
+        self._stacked_national_treatment_control_scaled_da, dims=constants.TIME
     )
     extreme_corr_var_pairs_df = _find_extreme_corr_pairs(
-        corr_mat, _PAIRWISE_NATIONAL_CORR_THRESHOLD
+        corr_mat, _NATIONAL_PAIRWISE_CORR_THRESHOLD
     )
 
     if not extreme_corr_var_pairs_df.empty:
@@ -1195,13 +1269,197 @@ class EDAEngine:
 
     pairwise_corr_results = [
         eda_outcome.PairwiseCorrResult(
-            level=eda_outcome.CorrelationAnalysisLevel.OVERALL,
+            level=eda_outcome.AnalysisLevel.NATIONAL,
             corr_matrix=corr_mat,
             extreme_corr_var_pairs=extreme_corr_var_pairs_df,
-            extreme_corr_threshold=_PAIRWISE_NATIONAL_CORR_THRESHOLD,
+            extreme_corr_threshold=_NATIONAL_PAIRWISE_CORR_THRESHOLD,
         )
     ]
     return eda_outcome.PairwiseCorrOutcome(
         findings=findings,
         pairwise_corr_results=pairwise_corr_results,
+    )
+
+  def _check_std(
+      self,
+      data: xr.DataArray,
+      level: eda_outcome.AnalysisLevel,
+      zero_std_message: str,
+  ) -> tuple[
+      Optional[eda_outcome.EDAFinding], eda_outcome.StandardDeviationResult
+  ]:
+    """Helper to check standard deviation."""
+    std_ds, outlier_df = _calculate_std(data)
+
+    finding = None
+    if (std_ds[_STD_WITHOUT_OUTLIERS_VAR_NAME] == 0).any():
+      finding = eda_outcome.EDAFinding(
+          severity=eda_outcome.EDASeverity.ATTENTION,
+          explanation=zero_std_message,
+      )
+
+    result = eda_outcome.StandardDeviationResult(
+        variable=str(data.name),
+        level=level,
+        std_ds=std_ds,
+        outlier_df=outlier_df,
+    )
+
+    return finding, result
+
+  def check_geo_std(
+      self,
+  ) -> eda_outcome.StandardDeviationOutcome:
+    """Checks std for geo-level KPI, treatments, R&F, and controls."""
+    if self._meridian.is_national:
+      raise ValueError('check_geo_std is not applicable for national models.')
+
+    findings = []
+    results = []
+
+    checks = [
+        (
+            self.kpi_scaled_da,
+            (
+                'KPI has zero standard deviation after removing outliers'
+                ' in certain geos, indicating weak or no signal in the response'
+                ' variable for these geos.  Please review the input data,'
+                ' and/or consider grouping these geos together.'
+            ),
+        ),
+        (
+            self._stacked_treatment_control_scaled_da,
+            (
+                'Some treatment or control variables have zero standard'
+                ' deviation after removing outliers in certain geo(s). Please'
+                ' review the input data. If these variables are sparse,'
+                ' consider combining them to mitigate potential model'
+                ' identifiability and convergence issues.'
+            ),
+        ),
+        (
+            self.all_reach_scaled_da,
+            (
+                'There are RF or Organic RF channels with zero variation of'
+                ' reach across time at a geo after outliers are removed. If'
+                ' these channels also have low variation of reach in other'
+                ' geos, consider modeling them as impression-based channels'
+                ' instead by taking reach * frequency.'
+            ),
+        ),
+        (
+            self.all_freq_da,
+            (
+                'There are RF or Organic RF channels with zero variation of'
+                ' frequency across time at a geo after outliers are removed. If'
+                ' these channels also have low variation of frequency in other'
+                ' geos, consider modeling them as impression-based channels'
+                ' instead by taking reach * frequency.'
+            ),
+        ),
+    ]
+
+    for data_da, message in checks:
+      if data_da is None:
+        continue
+      finding, result = self._check_std(
+          level=eda_outcome.AnalysisLevel.GEO,
+          data=data_da,
+          zero_std_message=message,
+      )
+      results.append(result)
+      if finding:
+        findings.append(finding)
+
+    # Add an INFO finding if no findings were added.
+    if not findings:
+      findings.append(
+          eda_outcome.EDAFinding(
+              severity=eda_outcome.EDASeverity.INFO,
+              explanation=(
+                  'Please review any identified outliers and the standard'
+                  ' deviation.'
+              ),
+          )
+      )
+
+    return eda_outcome.StandardDeviationOutcome(
+        findings=findings, std_results=results
+    )
+
+  def check_national_std(
+      self,
+  ) -> eda_outcome.StandardDeviationOutcome:
+    """Checks std for national-level KPI, treatments, R&F, and controls."""
+    findings = []
+    results = []
+
+    checks = [
+        (
+            self.national_kpi_scaled_da,
+            (
+                'The standard deviation of the scaled KPI drops from positive'
+                ' to zero after removing outliers, indicating sparsity of KPI'
+                ' i.e. lack of signal in the response variable. Please review'
+                ' the input data, and/or reconsider the feasibility of model'
+                ' fitting with this dataset.'
+            ),
+        ),
+        (
+            self._stacked_national_treatment_control_scaled_da,
+            (
+                'The standard deviation of these scaled treatment or control'
+                ' variables drops from positive to zero after removing'
+                ' outliers. This indicates sparsity of these variables, which'
+                ' may cause model identifiability and convergence issues.'
+                ' Please review the input data, and/or consider combining these'
+                ' variables to mitigate sparsity.'
+            ),
+        ),
+        (
+            self.national_all_reach_scaled_da,
+            (
+                'There are RF channels with totally zero variation of reach'
+                ' across time at the national level after outliers are removed.'
+                ' Consider modeling these RF channels as impression-based'
+                ' channels instead.'
+            ),
+        ),
+        (
+            self.national_all_freq_da,
+            (
+                'There are RF channels with totally zero variation of frequency'
+                ' across time at the national level after outliers are removed.'
+                ' Consider modeling these RF channels as impression-based'
+                ' channels instead.'
+            ),
+        ),
+    ]
+
+    for data_da, message in checks:
+      if data_da is None:
+        continue
+      finding, result = self._check_std(
+          data=data_da,
+          level=eda_outcome.AnalysisLevel.NATIONAL,
+          zero_std_message=message,
+      )
+      results.append(result)
+      if finding:
+        findings.append(finding)
+
+    # Add an INFO finding if no findings were added.
+    if not findings:
+      findings.append(
+          eda_outcome.EDAFinding(
+              severity=eda_outcome.EDASeverity.INFO,
+              explanation=(
+                  'Please review any identified outliers and the standard'
+                  ' deviation.'
+              ),
+          )
+      )
+
+    return eda_outcome.StandardDeviationOutcome(
+        findings=findings, std_results=results
     )
